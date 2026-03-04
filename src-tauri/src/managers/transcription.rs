@@ -1,6 +1,7 @@
 use crate::audio_toolkit::{apply_custom_words, filter_transcription_output};
 use crate::managers::model::{EngineType, ModelManager};
 use crate::settings::{get_settings, ModelUnloadTimeout};
+use hound;
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use serde::Serialize;
@@ -424,6 +425,14 @@ impl TranscriptionManager {
     }
 
     pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {
+        // Remote transcription path — short-circuit if configured
+        let settings_pre = get_settings(&self.app_handle);
+        if let Some(ref url) = settings_pre.remote_transcription_url {
+            if !url.is_empty() {
+                return self.transcribe_remote(audio, url, &settings_pre);
+            }
+        }
+
         // Update last activity timestamp
         self.last_activity.store(
             SystemTime::now()
@@ -639,6 +648,85 @@ impl TranscriptionManager {
         self.maybe_unload_immediately("transcription");
 
         Ok(final_result)
+    }
+
+    fn transcribe_remote(
+        &self,
+        audio: Vec<f32>,
+        base_url: &str,
+        settings: &crate::settings::AppSettings,
+    ) -> Result<String> {
+        use std::io::Cursor;
+
+        // Encode audio as WAV: 16kHz, mono, 16-bit PCM
+        let mut wav_bytes: Vec<u8> = Vec::new();
+        {
+            let cursor = Cursor::new(&mut wav_bytes);
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 16000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::new(cursor, spec)
+                .map_err(|e| anyhow::anyhow!("WAV encode error: {}", e))?;
+            for sample in &audio {
+                let s = (*sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                writer
+                    .write_sample(s)
+                    .map_err(|e| anyhow::anyhow!("WAV write error: {}", e))?;
+            }
+            writer
+                .finalize()
+                .map_err(|e| anyhow::anyhow!("WAV finalize error: {}", e))?;
+        }
+
+        let url = format!("{}/v1/audio/transcriptions", base_url.trim_end_matches('/'));
+        info!("Sending {} audio samples to remote transcription: {}", audio.len(), url);
+
+        let part = reqwest::blocking::multipart::Part::bytes(wav_bytes)
+            .file_name("audio.wav")
+            .mime_str("audio/wav")
+            .map_err(|e| anyhow::anyhow!("MIME error: {}", e))?;
+
+        let form = reqwest::blocking::multipart::Form::new()
+            .part("file", part)
+            .text("model", "deepdml/faster-whisper-large-v3-turbo-ct2");
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| anyhow::anyhow!("HTTP client build error: {}", e))?;
+
+        let response = client
+            .post(&url)
+            .multipart(form)
+            .send()
+            .map_err(|e| anyhow::anyhow!("Remote transcription request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "Remote transcription server returned {}",
+                response.status()
+            ));
+        }
+
+        let json: serde_json::Value = response
+            .json()
+            .map_err(|e| anyhow::anyhow!("Failed to parse transcription response: {}", e))?;
+
+        let text = json["text"].as_str().unwrap_or("").to_string();
+
+        // Apply same post-processing as local path
+        let corrected = if !settings.custom_words.is_empty() {
+            apply_custom_words(&text, &settings.custom_words, settings.word_correction_threshold)
+        } else {
+            text
+        };
+        let filtered = filter_transcription_output(&corrected);
+
+        info!("Remote transcription result: {:?}", filtered);
+        Ok(filtered)
     }
 }
 

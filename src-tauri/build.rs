@@ -141,9 +141,11 @@ fn build_apple_intelligence_bridge() {
     .to_string();
 
     // Check if the SDK supports FoundationModels (required for Apple Intelligence)
+    // Also require the macro plugin (only available with full Xcode, not CLT-only)
     let framework_path =
         Path::new(&sdk_path).join("System/Library/Frameworks/FoundationModels.framework");
-    let has_foundation_models = framework_path.exists();
+    let macro_plugin_path = Path::new("/Applications/Xcode.app/Contents/SharedFrameworks/FoundationModelsMacros.framework");
+    let has_foundation_models = framework_path.exists() && macro_plugin_path.exists();
 
     let source_file = if has_foundation_models {
         println!("cargo:warning=Building with Apple Intelligence support.");
